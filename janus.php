@@ -1,7 +1,7 @@
 <?php
 /**
  * Janus (janus.php) - Single-File PHP File Manager & Web Terminal
- * Version: 1.2.0
+ * Version: 1.2.2
  *
  * A high-performance, single-file PHP administration tool designed to run efficiently
  * on low-RAM servers and legacy hosting environments.
@@ -21,7 +21,7 @@
 
 // --- 1. CONFIGURATION ---
 define('PASSWORD', 'admin'); // Default password, CHANGE THIS for security!
-define('APP_NAME', 'Antigravity File Manager');
+define('APP_NAME', 'Janus File Manager');
 
 // --- 2. AUTHENTICATION & SESSION SETUP ---
 $password_hash = hash('sha256', PASSWORD);
