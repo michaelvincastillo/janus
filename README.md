@@ -49,11 +49,7 @@ A flexible system command execution terminal featuring:
 - **Multi-Method Dropdown**: Choose between `shell_exec`, `exec`, `system`, `passthru`, `proc_open`, and `popen` or let `Auto-detect` find the first working function.
 - **Disabled Option Highlighting**: Methods disabled in `disable_functions` are dynamically greyed out in the select list.
 - **Successful Status Feedback**: Prints the last successful command execution method (e.g. `Last executed via: proc_open`).
-- **Python & Perl Execution Wrappers**: Useful for WAF bypass or when default shell commands are restricted:
-  - **Python**: Invokes `python3` (or `python`) to run:
-    `python3 -c "import os, sys; os.system(sys.argv[1])" "<command>"`
-  - **Perl**: Invokes `perl` to run:
-    `perl -e "system(shift)" "<command>"`
+
 
 ### 4. 📝 PHP Tab (Interactive PHP Sandbox)
 A workspace to run PHP snippets directly on the server:
