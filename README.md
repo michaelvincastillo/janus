@@ -86,6 +86,25 @@ Integrates directly with local WordPress installations:
 
 ---
 
+## 🔒 CLI Obfuscator Tool (`jobf.php`)
+
+Janus includes a command-line utility to obfuscate and encrypt any PHP script (like `janus.php` or other files) using AES-256 encryption. It requires the OpenSSL PHP extension.
+
+### Usage
+Run the obfuscator from your command line:
+```bash
+php jobf.php [source_script.php] [password]
+```
+
+This generates a new encrypted file named `[source_script]_encrypted.php` in the same directory as the source script, leaving the original unencrypted file untouched.
+
+### Features
+- **AES-256 Encryption**: Encrypts the raw code using AES-256-CBC, with the SHA256 hash of your password as the key.
+- **Compact Loader Stub**: The generated file contains a sleek login card. After entering the decryption password, the script decries the payload in memory and runs it using a custom memory stream wrapper (`vs://`), writing nothing to disk.
+- **Zero Compression/Eval/Base64**: The generated loader stub does not use `gzcompress`, `eval`, or `base64_decode`, avoiding common security scanner flags.
+
+---
+
 ## 🔒 Security Recommendations
 
 - **Change the default password** immediately.
