@@ -1,7 +1,7 @@
 <?php
 /**
  * Janus (janus.php) - Single-File PHP File Manager & Web Terminal.
- * Version: 1.2.2
+ * Version: 1.2.4
  *
  * A high-performance, single-file PHP administration tool designed to run efficiently
  * on low-RAM servers and legacy hosting environments.
