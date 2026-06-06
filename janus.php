@@ -1,7 +1,7 @@
 <?php
 /**
  * Janus (janus.php) - Single-File PHP File Manager & Web Terminal.
- * Version: 1.2.7
+ * Version: 1.2.8
  *
  * A high-performance, single-file PHP administration tool designed to run efficiently
  * on low-RAM servers and legacy hosting environments.
@@ -559,12 +559,54 @@ function get_db_tables($pdo, $driver) {
         if ($driver === 'sqlite') {
             $q = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
             while ($row = $q->fetch(PDO::FETCH_NUM)) {
-                $tables[] = $row[0];
+                $tbl = $row[0];
+                $count = 0;
+                try {
+                    $cq = $pdo->query("SELECT COUNT(*) FROM " . quote_ident($tbl, $driver));
+                    if ($cq) {
+                        $count = intval($cq->fetchColumn());
+                    }
+                } catch (Exception $e) {}
+                $tables[] = [
+                    'name' => $tbl,
+                    'rows' => $count
+                ];
             }
         } else {
-            $q = $pdo->query("SHOW TABLES");
-            while ($row = $q->fetch(PDO::FETCH_NUM)) {
-                $tables[] = $row[0];
+            // MySQL/MariaDB: Try to query information_schema to get all table names and row counts in a single query.
+            // This is extremely fast because it doesn't execute COUNT(*) on every table individually.
+            $opt_query = "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME";
+            $success = false;
+            try {
+                $q = $pdo->query($opt_query);
+                if ($q) {
+                    while ($row = $q->fetch(PDO::FETCH_ASSOC)) {
+                        $tables[] = [
+                            'name' => $row['TABLE_NAME'],
+                            'rows' => intval($row['TABLE_ROWS'])
+                        ];
+                    }
+                    $success = true;
+                }
+            } catch (Exception $e) {}
+
+            // Fallback if information_schema query fails
+            if (!$success) {
+                $q = $pdo->query("SHOW TABLES");
+                while ($row = $q->fetch(PDO::FETCH_NUM)) {
+                    $tbl = $row[0];
+                    $count = 0;
+                    try {
+                        $cq = $pdo->query("SELECT COUNT(*) FROM " . quote_ident($tbl, $driver));
+                        if ($cq) {
+                            $count = intval($cq->fetchColumn());
+                        }
+                    } catch (Exception $e) {}
+                    $tables[] = [
+                        'name' => $tbl,
+                        'rows' => $count
+                    ];
+                }
             }
         }
     } catch (Exception $e) {}
@@ -582,6 +624,55 @@ function get_db_databases($pdo) {
     return $dbs;
 }
 
+function quote_ident($name, $driver) {
+    if ($driver === 'sqlite') {
+        return '"' . str_replace('"', '""', $name) . '"';
+    } else {
+        return '`' . str_replace('`', '``', $name) . '`';
+    }
+}
+
+function get_table_primary_keys($pdo, $driver, $table) {
+    $pks = [];
+    try {
+        if ($driver === 'sqlite') {
+            $q = $pdo->query("PRAGMA table_info(\"" . str_replace('"', '""', $table) . "\")");
+            if ($q) {
+                while ($row = $q->fetch(PDO::FETCH_ASSOC)) {
+                    if (isset($row['pk']) && intval($row['pk']) > 0) {
+                        $pks[] = $row['name'];
+                    }
+                }
+            }
+        } else {
+            $db_q = $pdo->query("SELECT DATABASE()");
+            $db_name = $db_q ? $db_q->fetchColumn() : '';
+            if ($db_name) {
+                $q = $pdo->prepare("
+                    SELECT COLUMN_NAME 
+                    FROM information_schema.COLUMNS 
+                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_KEY = 'PRI'
+                ");
+                $q->execute([$db_name, $table]);
+                while ($col = $q->fetchColumn()) {
+                    $pks[] = $col;
+                }
+            }
+            if (empty($pks)) {
+                $q_fallback = $pdo->query("SHOW KEYS FROM `" . str_replace('`', '``', $table) . "` WHERE Key_name = 'PRIMARY'");
+                if ($q_fallback) {
+                    while ($row = $q_fallback->fetch(PDO::FETCH_ASSOC)) {
+                        if (isset($row['Column_name'])) {
+                            $pks[] = $row['Column_name'];
+                        }
+                    }
+                }
+            }
+        }
+    } catch (Exception $e) {}
+    return $pks;
+}
+
 $db_conn_str = (isset($_COOKIE['fm_db_conn']) ? $_COOKIE['fm_db_conn'] : '');
 $db_conn_data = null;
 $db_connected = false;
@@ -590,8 +681,18 @@ $db_query_results = null;
 $db_query_info = '';
 $db_sql = '';
 $db_pdo = null;
+$db_active_table = '';
+$db_page = 1;
+$db_limit = 30;
+$total_rows = 0;
 
-if ($db_conn_str !== '') {
+$active_tab = (isset($_POST['tab']) ? $_POST['tab'] : (isset($_COOKIE['fm_tab']) ? $_COOKIE['fm_tab'] : 'files'));
+$valid_tabs = ['files', 'info', 'terminal', 'php', 'sql', 'wp'];
+if (!in_array($active_tab, $valid_tabs)) {
+    $active_tab = 'files';
+}
+
+if ($db_conn_str !== '' && $active_tab === 'sql') {
     $decoded = @base64_decode($db_conn_str);
     if ($decoded !== false) {
         $db_conn_data = @json_decode($decoded, true);
@@ -607,11 +708,6 @@ if ($db_conn_str !== '') {
 }
 
 // --- 6. TABS & ACTIONS POST PROCESSING ---
-$active_tab = (isset($_POST['tab']) ? $_POST['tab'] : (isset($_COOKIE['fm_tab']) ? $_COOKIE['fm_tab'] : 'files'));
-$valid_tabs = ['files', 'info', 'terminal', 'php', 'sql', 'wp'];
-if (!in_array($active_tab, $valid_tabs)) {
-    $active_tab = 'files';
-}
 $terminal_output = '';
 $terminal_cmd = '';
 $selected_exec_method = (isset($_COOKIE['fm_exec_method']) ? $_COOKIE['fm_exec_method'] : 'auto');
@@ -689,6 +785,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
 
     }
+
+    // Select Database
+    if ($action === 'db_select_database') {
+        $dbname = (isset($_POST['dbname']) ? $_POST['dbname'] : '');
+        if ($db_conn_str !== '') {
+            $decoded = @base64_decode($db_conn_str);
+            if ($decoded !== false) {
+                $data = @json_decode($decoded, true);
+                if (is_array($data)) {
+                    $data['dbname'] = $dbname;
+                    $encoded = base64_encode(json_encode($data));
+                    setcookie('fm_db_conn', $encoded, time() + 86400 * 30, '/');
+                    set_toast("Database selection changed to: " . ($dbname !== '' ? $dbname : '[none]'));
+                }
+            }
+        }
+        setcookie('fm_tab', 'sql', time() + 86400 * 30, '/');
+        header("Location: " . $_SERVER['PHP_SELF']);
+        exit;
+
+    }
     
     // Execute Database Query
     if ($action === 'db_query') {
@@ -715,6 +832,158 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 } else {
                     $db_error = "Database is not connected.";
+                }
+            } catch (PDOException $e) {
+                $db_error = "SQL Error: " . $e->getMessage();
+            }
+        }
+        setcookie('fm_tab', 'sql', time() + 86400 * 30, '/');
+        $_COOKIE['fm_tab'] = 'sql';
+        $active_tab = 'sql';
+        $db_active_table = '';
+    }
+
+    // Save Row (Insert or Update)
+    if ($action === 'db_save_row') {
+        $table = (isset($_POST['table']) ? $_POST['table'] : '');
+        $is_new = (isset($_POST['is_new']) && $_POST['is_new'] === '1');
+        $pk_data = json_decode(isset($_POST['pk_data']) ? $_POST['pk_data'] : '{}', true);
+        $fields = isset($_POST['fields']) ? $_POST['fields'] : [];
+        $nulls = isset($_POST['nulls']) ? $_POST['nulls'] : [];
+        $page = max(1, intval(isset($_POST['page']) ? $_POST['page'] : 1));
+        
+        if ($db_pdo && $table !== '') {
+            try {
+                if ($is_new) {
+                    $cols = [];
+                    $vals = [];
+                    $params = [];
+                    foreach ($fields as $col => $val) {
+                        $cols[] = quote_ident($col, $db_conn_data['driver']);
+                        if (isset($nulls[$col]) && $nulls[$col] === '1') {
+                            $vals[] = "NULL";
+                        } else {
+                            $vals[] = "?";
+                            $params[] = $val;
+                        }
+                    }
+                    $sql = "INSERT INTO " . quote_ident($table, $db_conn_data['driver']) . " (" . implode(', ', $cols) . ") VALUES (" . implode(', ', $vals) . ");";
+                    $stmt = $db_pdo->prepare($sql);
+                    $stmt->execute($params);
+                    set_toast("Row inserted successfully.");
+                } else {
+                    $sets = [];
+                    $params = [];
+                    foreach ($fields as $col => $val) {
+                        if (isset($nulls[$col]) && $nulls[$col] === '1') {
+                            $sets[] = quote_ident($col, $db_conn_data['driver']) . " = NULL";
+                        } else {
+                            $sets[] = quote_ident($col, $db_conn_data['driver']) . " = ?";
+                            $params[] = $val;
+                        }
+                    }
+                    
+                    $wheres = [];
+                    if (!empty($pk_data)) {
+                        foreach ($pk_data as $col => $val) {
+                            if ($val === null) {
+                                $wheres[] = quote_ident($col, $db_conn_data['driver']) . " IS NULL";
+                            } else {
+                                $wheres[] = quote_ident($col, $db_conn_data['driver']) . " = ?";
+                                $params[] = $val;
+                            }
+                        }
+                    } else {
+                        foreach ($fields as $col => $val) {
+                            if ($val === null) {
+                                $wheres[] = quote_ident($col, $db_conn_data['driver']) . " IS NULL";
+                            } else {
+                                $wheres[] = quote_ident($col, $db_conn_data['driver']) . " = ?";
+                                $params[] = $val;
+                            }
+                        }
+                    }
+                    $sql = "UPDATE " . quote_ident($table, $db_conn_data['driver']) . " SET " . implode(', ', $sets) . " WHERE " . implode(' AND ', $wheres) . ";";
+                    $stmt = $db_pdo->prepare($sql);
+                    $stmt->execute($params);
+                    set_toast("Row updated successfully.");
+                }
+            } catch (Exception $e) {
+                set_toast("Failed to save row: " . $e->getMessage(), "error");
+            }
+            
+            $_POST['action'] = 'db_browse';
+            $_POST['table'] = $table;
+            $_POST['page'] = $page;
+            $action = 'db_browse';
+        }
+    }
+
+    // Delete Row
+    if ($action === 'db_delete_row') {
+        $table = (isset($_POST['table']) ? $_POST['table'] : '');
+        $pk_data = json_decode(isset($_POST['pk_data']) ? $_POST['pk_data'] : '{}', true);
+        $page = max(1, intval(isset($_POST['page']) ? $_POST['page'] : 1));
+        
+        if ($db_pdo && $table !== '' && !empty($pk_data)) {
+            try {
+                $wheres = [];
+                $params = [];
+                foreach ($pk_data as $col => $val) {
+                    if ($val === null) {
+                        $wheres[] = quote_ident($col, $db_conn_data['driver']) . " IS NULL";
+                    } else {
+                        $wheres[] = quote_ident($col, $db_conn_data['driver']) . " = ?";
+                        $params[] = $val;
+                    }
+                }
+                $sql = "DELETE FROM " . quote_ident($table, $db_conn_data['driver']) . " WHERE " . implode(' AND ', $wheres) . ";";
+                $stmt = $db_pdo->prepare($sql);
+                $stmt->execute($params);
+                set_toast("Row deleted successfully.");
+            } catch (Exception $e) {
+                set_toast("Failed to delete row: " . $e->getMessage(), "error");
+            }
+            
+            $_POST['action'] = 'db_browse';
+            $_POST['table'] = $table;
+            $_POST['page'] = $page;
+            $action = 'db_browse';
+        }
+    }
+
+    // Browse Table
+    if ($action === 'db_browse') {
+        $db_active_table = (isset($_POST['table']) ? $_POST['table'] : '');
+        $db_page = max(1, intval(isset($_POST['page']) ? $_POST['page'] : 1));
+        
+        if ($db_pdo && $db_active_table !== '') {
+            try {
+                $cq = $db_pdo->query("SELECT COUNT(*) FROM " . quote_ident($db_active_table, $db_conn_data['driver']));
+                if ($cq) {
+                    $total_rows = intval($cq->fetchColumn());
+                }
+            } catch (Exception $e) {}
+            
+            $total_pages = ceil($total_rows / $db_limit);
+            if ($db_page > $total_pages && $total_pages > 0) {
+                $db_page = $total_pages;
+            }
+            
+            $offset = ($db_page - 1) * $db_limit;
+            $db_sql = "SELECT * FROM " . quote_ident($db_active_table, $db_conn_data['driver']) . " LIMIT $db_limit OFFSET $offset;";
+            
+            $start_time = microtime(true);
+            try {
+                $stmt = $db_pdo->query($db_sql);
+                $end_time = microtime(true);
+                $elapsed = $end_time - $start_time;
+                if ($stmt) {
+                    $db_query_results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    $row_count = count($db_query_results);
+                    $db_query_info = "Browsing table '" . htmlspecialchars($db_active_table) . "'. Returned $row_count rows in " . number_format($elapsed, 4) . " seconds.";
+                } else {
+                    $db_error = "Failed to retrieve rows.";
                 }
             } catch (PDOException $e) {
                 $db_error = "SQL Error: " . $e->getMessage();
@@ -1311,6 +1580,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
 
     }
+
+    // Delete a WordPress administrator
+    if ($action === 'wp_delete_admin') {
+        $user_id = intval((isset($_POST['user_id']) ? $_POST['user_id'] : 0));
+        
+        if ($wp_path !== '' && $user_id > 0) {
+            if (bootstrap_wordpress($wp_path)) {
+                if (!function_exists('wp_delete_user')) {
+                    require_once(ABSPATH . 'wp-admin/includes/user.php');
+                }
+                if (function_exists('wp_delete_user')) {
+                    $user = get_userdata($user_id);
+                    if ($user) {
+                        if (in_array('administrator', $user->roles)) {
+                            $result = wp_delete_user($user_id);
+                            if ($result) {
+                                set_toast("Administrator user '{$user->user_login}' deleted successfully!");
+                            } else {
+                                set_toast("Failed to delete user '{$user->user_login}'.", "error");
+                            }
+                        } else {
+                            set_toast("User is not an administrator.", "error");
+                        }
+                    } else {
+                        set_toast("User not found.", "error");
+                    }
+                } else {
+                    set_toast("WordPress delete user function is not available.", "error");
+                }
+            } else {
+                set_toast("Failed to bootstrap WordPress.", "error");
+            }
+        } else {
+            set_toast("WordPress path not set or invalid user selected.", "error");
+        }
+        setcookie('fm_tab', 'wp', time() + 3600, '/');
+        header("Location: " . $_SERVER['PHP_SELF']);
+        exit;
+
+    }
 }
 
 // --- 6. READ FILE/FOLDER DATA FOR LIST ---
@@ -1803,9 +2112,11 @@ function format_bytes($bytes, $precision = 1) {
             overflow-y: auto;
         }
         .db-results-table {
-            width: 100%;
+            width: max-content;
+            min-width: 100%;
             border-collapse: collapse;
             font-size: 12px;
+            table-layout: auto;
         }
         .db-results-table th {
             background-color: #1f2937;
@@ -1816,13 +2127,16 @@ function format_bytes($bytes, $precision = 1) {
             position: sticky;
             top: 0;
             z-index: 1;
+            white-space: nowrap;
         }
         .db-results-table td {
             padding: 5px 10px;
             border-bottom: 1px solid #2d3748;
             color: #e5e7eb;
-            white-space: pre-wrap;
-            word-break: break-all;
+            white-space: nowrap;
+            max-width: 400px;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .db-results-table tr:hover {
             background-color: #222a36;
@@ -2643,8 +2957,26 @@ function format_bytes($bytes, $precision = 1) {
                             if ($db_conn_data['driver'] === 'sqlite') {
                                 echo 'SQLite (' . htmlspecialchars(basename($db_conn_data['path'])) . ')';
                             } else {
-                                $db_name_display = empty($db_conn_data['dbname']) ? '[no db selected]' : $db_conn_data['dbname'];
-                                echo 'MySQL (' . htmlspecialchars($db_conn_data['host']) . ':' . htmlspecialchars($db_conn_data['port']) . ' / ' . htmlspecialchars($db_name_display) . ')';
+                                $databases = ($active_tab === 'sql' ? get_db_databases($db_pdo) : []);
+                                echo 'MySQL (' . htmlspecialchars($db_conn_data['host']) . ':' . htmlspecialchars($db_conn_data['port']) . ' / ';
+                                if (!empty($databases)) {
+                                    echo '<form method="post" style="display:inline; margin:0;">';
+                                    echo '<input type="hidden" name="action" value="db_select_database">';
+                                    echo '<select name="dbname" onchange="this.form.submit()" style="background:#1f2937; color:#fff; border:1px solid #4b5563; border-radius:3px; padding:2px 5px; font-size:12px; cursor:pointer;">';
+                                    if (empty($db_conn_data['dbname'])) {
+                                        echo '<option value="" selected>-- select database --</option>';
+                                    }
+                                    foreach ($databases as $db) {
+                                        $selected = ($db === $db_conn_data['dbname']) ? 'selected' : '';
+                                        echo '<option value="' . htmlspecialchars($db) . '" ' . $selected . '>' . htmlspecialchars($db) . '</option>';
+                                    }
+                                    echo '</select>';
+                                    echo '</form>';
+                                } else {
+                                    $db_name_display = empty($db_conn_data['dbname']) ? '[no db selected]' : $db_conn_data['dbname'];
+                                    echo htmlspecialchars($db_name_display);
+                                }
+                                echo ')';
                             }
                             ?>
                         </strong>
@@ -2656,22 +2988,48 @@ function format_bytes($bytes, $precision = 1) {
                 </div>
                 
                 <div class="sql-container">
-                    <!-- SIDEBAR: TABLES -->
+                    <!-- SIDEBAR: TABLES OR DATABASES -->
                     <div class="sql-sidebar">
-                        <div class="sql-sidebar-title">Tables</div>
-                        <?php
-                        $tables = get_db_tables($db_pdo, $db_conn_data['driver']);
-                        if (empty($tables)):
-                        ?>
-                            <div style="color: #6b7280; font-size: 11px; padding: 4px;">No tables found.</div>
-                        <?php else: ?>
-                            <?php foreach ($tables as $tbl): ?>
-                                <form method="post" style="margin: 0; display: block;">
-                                    <input type="hidden" name="action" value="db_query">
-                                    <input type="hidden" name="sql" value="SELECT * FROM <?php echo htmlspecialchars($tbl); ?> LIMIT 30;">
-                                    <button type="submit" class="sql-table-item" title="Click to browse top 30 rows"><?php echo htmlspecialchars($tbl); ?></button>
-                                </form>
-                            <?php endforeach; ?>
+                        <?php if ($active_tab === 'sql' && $db_connected): ?>
+                            <?php if ($db_conn_data['driver'] === 'mysql' && empty($db_conn_data['dbname'])): ?>
+                                <div class="sql-sidebar-title">Databases</div>
+                                <?php
+                                $databases = get_db_databases($db_pdo);
+                                if (empty($databases)):
+                                ?>
+                                    <div style="color: #6b7280; font-size: 11px; padding: 4px;">No databases found.</div>
+                                <?php else: ?>
+                                    <?php foreach ($databases as $db): ?>
+                                        <form method="post" style="margin: 0; display: block;">
+                                            <input type="hidden" name="action" value="db_select_database">
+                                            <input type="hidden" name="dbname" value="<?php echo htmlspecialchars($db); ?>">
+                                            <button type="submit" class="sql-table-item" title="Click to select database"><?php echo htmlspecialchars($db); ?></button>
+                                        </form>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            <?php else: ?>
+                                <div class="sql-sidebar-title">Tables</div>
+                                <?php
+                                $tables = get_db_tables($db_pdo, $db_conn_data['driver']);
+                                if (empty($tables)):
+                                ?>
+                                    <div style="color: #6b7280; font-size: 11px; padding: 4px;">No tables found.</div>
+                                <?php else: ?>
+                                    <?php foreach ($tables as $tbl_info): 
+                                        $tbl_name = $tbl_info['name'];
+                                        $tbl_rows = $tbl_info['rows'];
+                                    ?>
+                                        <form method="post" style="margin: 0; display: block;">
+                                            <input type="hidden" name="action" value="db_browse">
+                                            <input type="hidden" name="table" value="<?php echo htmlspecialchars($tbl_name); ?>">
+                                            <input type="hidden" name="page" value="1">
+                                            <button type="submit" class="sql-table-item" title="Click to browse table">
+                                                <?php echo htmlspecialchars($tbl_name); ?> <span style="color: #9ca3af; font-size: 11px;">(<?php echo $tbl_rows; ?>)</span>
+                                            </button>
+                                        </form>
+                                    <?php endforeach; ?>
+                                <?php endif; ?>
+                            <?php endif; ?>
                         <?php endif; ?>
                     </div>
                     
@@ -2685,64 +3043,332 @@ function format_bytes($bytes, $precision = 1) {
                             <div class="db-success-box"><?php echo htmlspecialchars($db_query_info); ?></div>
                         <?php endif; ?>
                         
-                        <!-- QUERY EDITOR -->
-                        <form method="post">
-                            <input type="hidden" name="action" value="db_query">
+                        <?php if ($db_conn_data['driver'] === 'mysql' && empty($db_conn_data['dbname'])): ?>
+                            <div style="background-color: #11151d; border: 1px solid #2d3748; padding: 20px; border-radius: 4px;">
+                                <h3 style="margin-top: 0; color: #fff; font-size: 16px; border-bottom: 1px solid #2d3748; padding-bottom: 10px; margin-bottom: 15px;">Select a Database</h3>
+                                <p style="color: #9ca3af; font-size: 12px; margin-bottom: 15px;">No database selected. Please select one from the list below to browse tables and execute queries:</p>
+                                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;">
+                                    <?php
+                                    $databases = ($active_tab === 'sql' ? get_db_databases($db_pdo) : []);
+                                    if (empty($databases)):
+                                    ?>
+                                        <div style="color: #ef4444; font-size: 12px; padding: 10px;">No databases found.</div>
+                                    <?php else: ?>
+                                        <?php foreach ($databases as $db): ?>
+                                            <form method="post" style="margin: 0;">
+                                                <input type="hidden" name="action" value="db_select_database">
+                                                <input type="hidden" name="dbname" value="<?php echo htmlspecialchars($db); ?>">
+                                                <button type="submit" class="action-btn" style="width: 100%; text-align: left; background-color: #1f2937; border-color: #374151; padding: 12px; font-weight: normal; display: flex; justify-content: space-between; align-items: center; border-radius: 4px; transition: all 0.2s;">
+                                                    <span style="color: #fff; font-weight: bold; font-size: 13px;"><?php echo htmlspecialchars($db); ?></span>
+                                                    <span style="color: #38bdf8; font-size: 11px;">Connect &rarr;</span>
+                                                </button>
+                                            </form>
+                                        <?php endforeach; ?>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        <?php else: ?>
+                            <!-- QUERY EDITOR -->
+                            <form method="post">
+                                <input type="hidden" name="action" value="db_query">
+                                
+                                <div style="margin-bottom: 8px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center;">
+                                    <span style="color: #9ca3af; font-size: 11px; text-transform: uppercase; font-weight: bold; margin-right: 5px;">Templates:</span>
+                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('SELECT * FROM tableName LIMIT 30;')">SELECT</button>
+                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('INSERT INTO tableName (column1, column2) VALUES (\'value1\', \'value2\');')">INSERT</button>
+                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('UPDATE tableName SET column1 = \'value1\' WHERE id = 1;')">UPDATE</button>
+                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('DELETE FROM tableName WHERE id = 1;')">DELETE</button>
+                                    <?php if ($db_conn_data['driver'] === 'mysql'): ?>
+                                        <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('DESCRIBE tableName;')">DESCRIBE</button>
+                                    <?php else: ?>
+                                        <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('PRAGMA table_info(tableName);')">PRAGMA info</button>
+                                    <?php endif; ?>
+                                </div>
+                                
+                                <div style="margin-bottom: 10px;">
+                                    <textarea name="sql" id="db-sql-editor" class="editor-textarea" style="height: 180px;" placeholder="SELECT * FROM tableName;" required><?php echo htmlspecialchars($db_sql); ?></textarea>
+                                </div>
+                                
+                                <div>
+                                    <button type="submit" class="action-btn" style="background-color: #3b82f6; border-color: #2563eb; padding: 6px 16px;">Execute Query</button>
+                                </div>
+                            </form>
                             
-                            <div style="margin-bottom: 8px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center;">
-                                <span style="color: #9ca3af; font-size: 11px; text-transform: uppercase; font-weight: bold; margin-right: 5px;">Templates:</span>
-                                <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('SELECT * FROM tableName LIMIT 30;')">SELECT</button>
-                                <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('INSERT INTO tableName (column1, column2) VALUES (\'value1\', \'value2\');')">INSERT</button>
-                                <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('UPDATE tableName SET column1 = \'value1\' WHERE id = 1;')">UPDATE</button>
-                                <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('DELETE FROM tableName WHERE id = 1;')">DELETE</button>
-                                <?php if ($db_conn_data['driver'] === 'mysql'): ?>
-                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('DESCRIBE tableName;')">DESCRIBE</button>
-                                <?php else: ?>
-                                    <button type="button" class="action-btn" style="font-size: 11px; padding: 3px 8px;" onclick="insertSqlTemplate('PRAGMA table_info(tableName);')">PRAGMA info</button>
+                            <!-- RESULTS TABLE -->
+                            <?php if ($db_query_results !== null): ?>
+                                <div class="modal-title" style="margin-top: 10px; margin-bottom: 5px;">
+                                    <?php echo ($db_active_table !== '') ? "Table Contents: " . htmlspecialchars($db_active_table) : "Query Output"; ?>
+                                </div>
+                                
+                                <?php if ($db_active_table !== ''): ?>
+                                    <!-- Pagination Toolbar -->
+                                    <?php $total_pages = ceil($total_rows / $db_limit); ?>
+                                    <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center; background:#11151d; border:1px solid #2d3748; padding:8px 12px; border-radius:4px;">
+                                        <div style="display:flex; align-items:center; gap:5px;">
+                                            <span style="color:#9ca3af; font-size:12px;">Page:</span>
+                                            
+                                            <!-- First Page [<<] -->
+                                            <form method="post" style="margin:0; display:inline;">
+                                                <input type="hidden" name="action" value="db_browse">
+                                                <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                <input type="hidden" name="page" value="1">
+                                                <button type="submit" class="action-btn" style="padding:2px 6px; font-size:11px;" <?php echo ($db_page <= 1) ? 'disabled' : ''; ?>>&lt;&lt;</button>
+                                            </form>
+                                            
+                                            <!-- Prev Page [<] -->
+                                            <form method="post" style="margin:0; display:inline;">
+                                                <input type="hidden" name="action" value="db_browse">
+                                                <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                <input type="hidden" name="page" value="<?php echo max(1, $db_page - 1); ?>">
+                                                <button type="submit" class="action-btn" style="padding:2px 6px; font-size:11px;" <?php echo ($db_page <= 1) ? 'disabled' : ''; ?>>&lt;</button>
+                                            </form>
+                                            
+                                            <!-- Page input -->
+                                            <form method="post" style="margin:0; display:inline;">
+                                                <input type="hidden" name="action" value="db_browse">
+                                                <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                <input type="number" name="page" value="<?php echo $db_page; ?>" min="1" max="<?php echo max(1, $total_pages); ?>" style="width: 50px; text-align: center; background: #1f2937; color: #fff; border: 1px solid #4b5563; border-radius: 4px; padding: 2px; font-size: 11px; font-weight: bold; margin: 0 2px;" onchange="this.form.submit()">
+                                            </form>
+                                            <span style="color:#9ca3af; font-size:12px; margin:0 5px 0 2px;">/ <?php echo max(1, $total_pages); ?></span>
+                                            
+                                            <!-- Next Page [>] -->
+                                            <form method="post" style="margin:0; display:inline;">
+                                                <input type="hidden" name="action" value="db_browse">
+                                                <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                <input type="hidden" name="page" value="<?php echo min($total_pages, $db_page + 1); ?>">
+                                                <button type="submit" class="action-btn" style="padding:2px 6px; font-size:11px;" <?php echo ($db_page >= $total_pages) ? 'disabled' : ''; ?>>&gt;</button>
+                                            </form>
+                                            
+                                            <!-- Last Page [>>] -->
+                                            <form method="post" style="margin:0; display:inline;">
+                                                <input type="hidden" name="action" value="db_browse">
+                                                <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                <input type="hidden" name="page" value="<?php echo max(1, $total_pages); ?>">
+                                                <button type="submit" class="action-btn" style="padding:2px 6px; font-size:11px;" <?php echo ($db_page >= $total_pages) ? 'disabled' : ''; ?>>&gt;&gt;</button>
+                                            </form>
+                                            
+                                            <span style="color:#6b7280; font-size:11px; margin-left:10px;">(Total rows: <?php echo $total_rows; ?>)</span>
+                                        </div>
+                                        <div>
+                                            <button type="button" class="action-btn" style="background:#10b981; border-color:#059669; font-size:12px; padding:4px 10px;" onclick="openDbEditModal(null, true)">+ Add Row</button>
+                                        </div>
+                                    </div>
                                 <?php endif; ?>
-                            </div>
-                            
-                            <div style="margin-bottom: 10px;">
-                                <textarea name="sql" id="db-sql-editor" class="editor-textarea" style="height: 180px;" placeholder="SELECT * FROM tableName;" required><?php echo htmlspecialchars($db_sql); ?></textarea>
-                            </div>
-                            
-                            <div>
-                                <button type="submit" class="action-btn" style="background-color: #3b82f6; border-color: #2563eb; padding: 6px 16px;">Execute Query</button>
-                            </div>
-                        </form>
-                        
-                        <!-- RESULTS TABLE -->
-                        <?php if ($db_query_results !== null): ?>
-                            <div class="modal-title" style="margin-top: 10px; margin-bottom: 5px;">Query Output</div>
-                            <?php if (empty($db_query_results)): ?>
-                                <div style="color: #9ca3af; padding: 10px; background-color: #11151d; border: 1px solid #2d3748; border-radius: 4px;">Returned empty result set (0 rows).</div>
-                            <?php else: ?>
-                                <div class="db-results-container">
-                                    <table class="db-results-table">
-                                        <thead>
-                                            <tr>
-                                                <?php foreach (array_keys($db_query_results[0]) as $col): ?>
-                                                    <th><?php echo htmlspecialchars($col); ?></th>
-                                                <?php endforeach; ?>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <?php foreach ($db_query_results as $row): ?>
+
+                                <?php if (empty($db_query_results)): ?>
+                                    <div style="color: #9ca3af; padding: 10px; background-color: #11151d; border: 1px solid #2d3748; border-radius: 4px;">Returned empty result set (0 rows).</div>
+                                <?php else: ?>
+                                    <div class="db-results-container">
+                                        <table class="db-results-table">
+                                            <thead>
                                                 <tr>
-                                                    <?php foreach ($row as $val): ?>
-                                                        <td><?php echo $val === null ? '<span style="color:#6b7280; font-style:italic;">NULL</span>' : htmlspecialchars($val); ?></td>
+                                                    <?php if ($db_active_table !== ''): ?>
+                                                        <th>Actions</th>
+                                                    <?php endif; ?>
+                                                    <?php foreach (array_keys($db_query_results[0]) as $col): ?>
+                                                        <th><?php echo htmlspecialchars($col); ?></th>
                                                     <?php endforeach; ?>
                                                 </tr>
-                                            <?php endforeach; ?>
-                                        </tbody>
-                                    </table>
-                                </div>
+                                            </thead>
+                                            <tbody>
+                                                <?php 
+                                                $active_pks = [];
+                                                if ($db_active_table !== '' && $active_tab === 'sql') {
+                                                    $active_pks = get_table_primary_keys($db_pdo, $db_conn_data['driver'], $db_active_table);
+                                                }
+                                                ?>
+                                                <?php foreach ($db_query_results as $row): ?>
+                                                    <tr>
+                                                        <?php if ($db_active_table !== ''): ?>
+                                                            <td style="white-space: nowrap; width: 90px; text-align: left;">
+                                                                <button type="button" class="action-btn" style="background:#3b82f6; border-color:#2563eb; padding:2px 6px; font-size:11px;" onclick="openDbEditModal(<?php echo htmlspecialchars(json_encode($row), ENT_QUOTES, 'UTF-8'); ?>, false)">Edit</button>
+                                                                
+                                                                <form method="post" style="display:inline; margin:0;" onsubmit="return confirm('Are you sure you want to delete this row?');">
+                                                                    <input type="hidden" name="action" value="db_delete_row">
+                                                                    <input type="hidden" name="table" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                                                    <input type="hidden" name="page" value="<?php echo $db_page; ?>">
+                                                                    <?php
+                                                                    $row_pk_data = [];
+                                                                    $pk_list = !empty($active_pks) ? $active_pks : array_keys($row);
+                                                                    foreach ($pk_list as $pk) {
+                                                                        $row_pk_data[$pk] = isset($row[$pk]) ? $row[$pk] : null;
+                                                                    }
+                                                                    ?>
+                                                                    <input type="hidden" name="pk_data" value="<?php echo htmlspecialchars(json_encode($row_pk_data), ENT_QUOTES, 'UTF-8'); ?>">
+                                                                    <button type="submit" class="action-btn" style="background:#ef4444; border-color:#dc2626; padding:2px 6px; font-size:11px;">Delete</button>
+                                                                </form>
+                                                            </td>
+                                                        <?php endif; ?>
+                                                        <?php foreach ($row as $val): ?>
+                                                            <td title="<?php echo htmlspecialchars($val === null ? 'NULL' : strval($val)); ?>"><?php echo $val === null ? '<span style="color:#6b7280; font-style:italic;">NULL</span>' : htmlspecialchars($val); ?></td>
+                                                        <?php endforeach; ?>
+                                                    </tr>
+                                                <?php endforeach; ?>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <?php if ($db_active_table !== ''): ?>
+                                        <!-- Keep track of the active table primary keys for the editor script -->
+                                        <script>
+                                            var activeTablePks = <?php echo json_encode($active_pks); ?>;
+                                        </script>
+                                        <input type="hidden" id="db-active-table-name" value="<?php echo htmlspecialchars($db_active_table); ?>">
+                                    <?php endif; ?>
+                                <?php endif; ?>
                             <?php endif; ?>
                         <?php endif; ?>
                     </div>
                 </div>
                 
             <?php endif; ?>
+            
+            <!-- EDIT ROW MODAL -->
+            <div id="db-edit-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center;">
+                <div style="background:#11151d; border:1px solid #374151; width:500px; max-width:90%; border-radius:6px; padding:20px; box-shadow:0 10px 25px rgba(0,0,0,0.5); display:flex; flex-direction:column; max-height:85%;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #2d3748; padding-bottom:10px; margin-bottom:15px;">
+                        <h4 id="db-edit-modal-title" style="margin:0; color:#fff; font-size:14px;">Edit Row</h4>
+                        <button type="button" onclick="closeDbEditModal()" style="background:none; border:none; color:#9ca3af; font-size:20px; cursor:pointer; line-height:1;">&times;</button>
+                    </div>
+                    <form id="db-edit-form" method="post" style="overflow-y:auto; flex:1; padding-right:5px; margin-bottom:15px;">
+                        <input type="hidden" name="action" value="db_save_row">
+                        <input type="hidden" name="table" id="db-edit-table">
+                        <input type="hidden" name="is_new" id="db-edit-is-new">
+                        <input type="hidden" name="page" value="<?php echo $db_page; ?>">
+                        <input type="hidden" name="pk_data" id="db-edit-pk-data">
+                        <div id="db-edit-fields-container"></div>
+                    </form>
+                    <div style="display:flex; justify-content:flex-end; gap:10px; border-top:1px solid #2d3748; padding-top:10px;">
+                        <button type="button" class="action-btn" style="background:#4b5563; border-color:#374151;" onclick="closeDbEditModal()">Cancel</button>
+                        <button type="submit" form="db-edit-form" class="action-btn" style="background:#10b981; border-color:#059669;">Save Changes</button>
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                function openDbEditModal(row, isNew) {
+                    var container = document.getElementById('db-edit-fields-container');
+                    container.innerHTML = '';
+                    
+                    var tableInput = document.getElementById('db-active-table-name');
+                    if (!tableInput) return;
+                    
+                    document.getElementById('db-edit-table').value = tableInput.value;
+                    document.getElementById('db-edit-is-new').value = isNew ? '1' : '0';
+                    document.getElementById('db-edit-modal-title').innerText = isNew ? 'Add New Row' : 'Edit Row';
+                    
+                    var pks = window.activeTablePks || [];
+                    var pkData = {};
+                    if (row) {
+                        if (pks.length > 0) {
+                            pks.forEach(function(pk) {
+                                if (row[pk] !== undefined) {
+                                    pkData[pk] = row[pk];
+                                }
+                            });
+                        } else {
+                            Object.keys(row).forEach(function(key) {
+                                pkData[key] = row[key];
+                            });
+                        }
+                    }
+                    document.getElementById('db-edit-pk-data').value = JSON.stringify(pkData);
+                    
+                    var columns = Object.keys(row || {});
+                    if (columns.length === 0) {
+                        var headers = document.querySelectorAll('.db-results-table th');
+                        headers.forEach(function(th) {
+                            var colName = th.innerText.trim();
+                            if (colName !== 'Actions') {
+                                columns.push(colName);
+                            }
+                        });
+                    }
+                    
+                    columns.forEach(function(col) {
+                        var val = isNew ? '' : (row[col] !== null ? row[col] : '');
+                        var isPk = pks && pks.indexOf(col) !== -1;
+                        
+                        var fieldDiv = document.createElement('div');
+                        fieldDiv.style.marginBottom = '12px';
+                        
+                        var label = document.createElement('label');
+                        label.style.display = 'block';
+                        label.style.fontSize = '11px';
+                        label.style.color = '#9ca3af';
+                        label.style.textTransform = 'uppercase';
+                        label.style.marginBottom = '4px';
+                        label.innerText = col + (isPk ? ' (Primary Key)' : '');
+                        fieldDiv.appendChild(label);
+                        
+                        var input;
+                        if (typeof val === 'string' && val.length > 50) {
+                            input = document.createElement('textarea');
+                            input.className = 'editor-textarea';
+                            input.style.height = '60px';
+                            input.style.width = '100%';
+                            input.style.boxSizing = 'border-box';
+                        } else {
+                            input = document.createElement('input');
+                            input.type = 'text';
+                            input.className = 'form-input';
+                            input.style.width = '100%';
+                            input.style.boxSizing = 'border-box';
+                        }
+                        input.name = 'fields[' + col + ']';
+                        input.value = val;
+                        
+                        var nullDiv = document.createElement('div');
+                        nullDiv.style.display = 'flex';
+                        nullDiv.style.alignItems = 'center';
+                        nullDiv.style.marginTop = '4px';
+                        
+                        var nullCheckbox = document.createElement('input');
+                        nullCheckbox.type = 'checkbox';
+                        nullCheckbox.name = 'nulls[' + col + ']';
+                        nullCheckbox.value = '1';
+                        nullCheckbox.id = 'null-' + col;
+                        nullCheckbox.style.marginRight = '6px';
+                        nullCheckbox.style.width = 'auto';
+                        if (!isNew && row[col] === null) {
+                            nullCheckbox.checked = true;
+                            input.disabled = true;
+                            input.style.opacity = '0.5';
+                        }
+                        
+                        nullCheckbox.onchange = function() {
+                            if (nullCheckbox.checked) {
+                                input.disabled = true;
+                                input.style.opacity = '0.5';
+                            } else {
+                                input.disabled = false;
+                                input.style.opacity = '1';
+                            }
+                        };
+                        
+                        var nullLabel = document.createElement('label');
+                        nullLabel.htmlFor = 'null-' + col;
+                        nullLabel.style.fontSize = '11px';
+                        nullLabel.style.color = '#6b7280';
+                        nullLabel.style.cursor = 'pointer';
+                        nullLabel.innerText = 'Set NULL';
+                        
+                        nullDiv.appendChild(nullCheckbox);
+                        nullDiv.appendChild(nullLabel);
+                        
+                        fieldDiv.appendChild(input);
+                        fieldDiv.appendChild(nullDiv);
+                        container.appendChild(fieldDiv);
+                    });
+                    
+                    var modal = document.getElementById('db-edit-modal');
+                    modal.style.display = 'flex';
+                }
+                
+                function closeDbEditModal() {
+                    document.getElementById('db-edit-modal').style.display = 'none';
+                }
+            </script>
         </div>
 
         <!-- ================== WP TOOLS TAB ================== -->
@@ -2806,28 +3432,45 @@ function format_bytes($bytes, $precision = 1) {
                     </div>
 
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                        <!-- Col 1: Auto Login -->
-                        <div style="background-color: #11151d; border: 1px solid #2d3748; padding: 20px; border-radius: 4px;">
-                            <h4 style="margin-top: 0; color: #fff; border-bottom: 1px solid #2d3748; padding-bottom: 10px;">Log in as WordPress Administrator</h4>
-                            <p style="color: #9ca3af; font-size: 12px; margin-bottom: 15px;">Select an administrator user below to log in directly to the WordPress admin panel.</p>
+                        <!-- Col 1: Manage Administrators -->
+                        <div style="background-color: #11151d; border: 1px solid #2d3748; padding: 20px; border-radius: 4px; display: flex; flex-direction: column;">
+                            <h4 style="margin-top: 0; color: #fff; border-bottom: 1px solid #2d3748; padding-bottom: 10px;">Manage WordPress Administrators</h4>
+                            <p style="color: #9ca3af; font-size: 12px; margin-bottom: 15px;">Log in directly or delete administrator accounts from this WordPress site.</p>
                             
                             <?php if (empty($wp_admins)): ?>
                                 <div style="color: #ef4444; font-size: 12px;">No administrator users found.</div>
                             <?php else: ?>
-                                <form method="post">
-                                    <input type="hidden" name="action" value="wp_login_admin">
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: block; font-size: 11px; color: #9ca3af; text-transform: uppercase; margin-bottom: 5px;">Admin User</label>
-                                        <select name="user_id" class="form-input" style="width: 100%; box-sizing: border-box; background-color: #111827;">
+                                <div style="max-height: 250px; overflow-y: auto; border: 1px solid #2d3748; border-radius: 4px; background: #111827; flex: 1;">
+                                    <table style="width: 100%; border-collapse: collapse; font-size: 12px; text-align: left;">
+                                        <thead>
+                                            <tr style="border-bottom: 1px solid #2d3748; background: #1f2937; color: #9ca3af;">
+                                                <th style="padding: 8px;">Username</th>
+                                                <th style="padding: 8px;">Email</th>
+                                                <th style="padding: 8px; text-align: right;">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
                                             <?php foreach ($wp_admins as $admin): ?>
-                                                <option value="<?php echo $admin['ID']; ?>">
-                                                    <?php echo htmlspecialchars($admin['user_login']); ?> (<?php echo htmlspecialchars($admin['user_email']); ?>)
-                                                </option>
+                                                <tr style="border-bottom: 1px solid #1f2937;">
+                                                    <td style="padding: 8px; color: #fff; font-weight: bold;"><?php echo htmlspecialchars($admin['user_login']); ?></td>
+                                                    <td style="padding: 8px; color: #9ca3af; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="<?php echo htmlspecialchars($admin['user_email']); ?>"><?php echo htmlspecialchars($admin['user_email']); ?></td>
+                                                    <td style="padding: 8px; text-align: right; white-space: nowrap;">
+                                                        <form method="post" style="margin: 0; display: inline;">
+                                                            <input type="hidden" name="action" value="wp_login_admin">
+                                                            <input type="hidden" name="user_id" value="<?php echo $admin['ID']; ?>">
+                                                            <button type="submit" class="action-btn" style="background-color: #10b981; border-color: #059669; padding: 2px 6px; font-size: 11px;" title="Log in as admin">Login</button>
+                                                        </form>
+                                                        <form method="post" style="margin: 0; display: inline;" onsubmit="return confirm('Are you sure you want to delete administrator user \'<?php echo htmlspecialchars(addslashes($admin['user_login']), ENT_QUOTES); ?>\'?');">
+                                                            <input type="hidden" name="action" value="wp_delete_admin">
+                                                            <input type="hidden" name="user_id" value="<?php echo $admin['ID']; ?>">
+                                                            <button type="submit" class="action-btn" style="background-color: #ef4444; border-color: #dc2626; padding: 2px 6px; font-size: 11px;" title="Delete administrator">Delete</button>
+                                                        </form>
+                                                    </td>
+                                                </tr>
                                             <?php endforeach; ?>
-                                        </select>
-                                    </div>
-                                    <button type="submit" class="action-btn" style="background-color: #10b981; border-color: #059669; width: 100%;">Log in as Admin</button>
-                                </form>
+                                        </tbody>
+                                    </table>
+                                </div>
                             <?php endif; ?>
                         </div>
 
